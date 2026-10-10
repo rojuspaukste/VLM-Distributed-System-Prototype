@@ -3,12 +3,14 @@
 **Edge VLM pipeline: ask a camera questions.** Coursework prototype for the *Cloud Computing & Big Data* course
 (VILNIUS TECH). A webcam points at a desk or a room, and you type free-form questions about what it sees ("What
 objects are on the desk?", "What did the person just do?"). Camera devices stream frames and questions to an edge
-server. There, a Spark Structured Streaming job reduces the stream to **keyframes** and keeps a short **visual
-memory** of recent keyframes per device. Each question goes, with that visual memory, to an open-source
+server. There, a Spark Structured Streaming job reduces the stream to **keyframes** and keeps a **visual memory** of
+the last 30 seconds per device. Each question goes, together with frames from that memory, to an open-source
 vision-language model (**Qwen2.5-VL-3B-Instruct**) on the GPU. **Nothing reaches the model unless you ask.**
 
-This README covers **Phase 1**: the complete system, run natively (Kafka, MongoDB, Spark and the VLM service in
-WSL2 Ubuntu; the camera device on Windows). Phase 2 will package it with Docker Compose and deploy it elsewhere.
+**Status (October 2026): Phase 1 is complete.** The whole system runs natively on one Windows PC: Kafka, MongoDB,
+Spark and the VLM service in WSL2 Ubuntu, the camera device on Windows. It has been tested with the LIBERO robot
+videos and with a USB webcam (Logitech C930e); the measured results are in section 5. **Phase 2** will package the
+system with Docker Compose and deploy it somewhere other than the development PC.
 
 ```
  Windows                              │ WSL2 Ubuntu
@@ -19,7 +21,7 @@ WSL2 Ubuntu; the camera device on Windows). Phase 2 will package it with Docker 
                                       │   processor/keyframe_job.py  (Spark Structured Streaming)
                                       │      executors: decode + dHash every frame, downscale selected frames
                                       │      driver:    keyframes, visual memory per device ──▶ MongoDB: batch_stats, keyframes
-                                      │      │ one bundle per question: current frame + visual memory
+                                      │      │ one bundle per question: current frame + 8 memory frames
                                       │      ▼
                                       │   Kafka topic queries (4 partitions)
                                       │      │
@@ -42,16 +44,20 @@ WSL2 Ubuntu; the camera device on Windows). Phase 2 will package it with Docker 
    | `change` | Hamming distance to the last keyframe's hash ≥ `CHANGE_THRESHOLD` (default 6 of 64 bits) |
    | `heartbeat` | more than `HEARTBEAT_S` seconds (default 5) since the device's last keyframe |
 
-   Keyframe metadata and per-batch statistics go to MongoDB (never images).
-2. **Visual memory.** For each device, the driver keeps the newest `WINDOW_MAX_FRAMES` keyframes (default 8) from
-   the last `WINDOW_SECONDS` (default 30), downscaled on the executors to at most `WINDOW_IMAGE_MAX_SIDE` pixels on
-   the longest side (default 448). The images live only in the driver's memory.
+   A still scene gives one keyframe every 5 s; movement gives a keyframe on almost every frame. Keyframe metadata and
+   per-batch statistics go to MongoDB (never images).
+2. **Visual memory.** For each device, the driver keeps up to `WINDOW_STORE_MAX` keyframes (default 32) from the
+   last `WINDOW_SECONDS` (default 30), downscaled on the executors to at most `WINDOW_IMAGE_MAX_SIDE` pixels on the
+   longest side (default 448). When the memory is full, it drops the frame that is closest in time to its
+   predecessor, so even a long movement leaves frames spread over the whole 30 s. The images live only in the
+   driver's memory.
 3. **Questions.** Every frame carries the device's current question. When the question changes, the processor
-   publishes **one** bundle to the `queries` topic: the downscaled current frame plus the visual memory, oldest to
-   newest. Without questions nothing is published and the GPU stays idle.
-4. **Answers.** The VLM service answers every bundle in order with the newest `CONTEXT_FRAMES` (default 8) earlier
-   frames plus the current frame. It publishes the answer to the `answers` topic, where the asking device prints
-   it, and stores it in MongoDB with timestamps for every stage.
+   publishes **one** bundle to the `queries` topic: the downscaled current frame plus `WINDOW_MAX_FRAMES` (default 8)
+   memory frames spread evenly in time, always including the newest one. Without questions nothing is published and
+   the GPU stays idle.
+4. **Answers.** The VLM service answers every bundle in order, with the newest `CONTEXT_FRAMES` (default 8) frames of
+   the bundle plus the current frame. It publishes the answer to the `answers` topic, where the asking device prints
+   it, and stores it in MongoDB with timestamps for every stage and the time span the images covered.
 
 ---
 
@@ -190,17 +196,17 @@ bash ~/edge-vlm/infra/kafka_start.sh
 
 On the first run the script formats the storage directory (`~/edge-vlm-data/kafka`). Keep this terminal
 open: it runs the broker, and it keeps WSL2 running (WSL2 may shut the Ubuntu VM down when no terminal is
-open). Ctrl+C stops the broker.
+open). Ctrl+C stops the broker. If a broker is already running, the script refuses to start a second one.
 
 **First time only: create the topics and test the connection** (any Ubuntu terminal)
 
 ```bash
 cd ~/edge-vlm && source ~/.venvs/edge-vlm-tools/bin/activate
 python infra/create_topics.py     # frames (4 partitions), queries (4), answers (1); existing topics are skipped
-python tools/smoke_test.py        # OK: Kafka round trip via 127.0.0.1:9092 took 15 ms
+python tools/smoke_test.py        # OK: Kafka round trip via 127.0.0.1:9092 took 58 ms
 ```
 
-`create_topics.py` also deletes the `keyframes` topic of the first design if it still exists. Then run the same
+`create_topics.py` also deletes the `keyframes` topic of an earlier version if it still exists. Then run the same
 test from Windows: `& $toolsPy "$repo\tools\smoke_test.py"`.
 
 **Terminal 2: processor** (Ubuntu)
@@ -212,11 +218,12 @@ python processor/keyframe_job.py
 ```
 
 The first start downloads the Kafka connector from Maven Central. Wait for `Streaming query started`. The job
-logs one line per micro-batch and writes a `batch_stats` document for each, and one line per question bundle:
+logs one line per micro-batch and writes a `batch_stats` document for each, and one line per question bundle with
+the time span its memory frames cover:
 
 ```
-batch 86: 11 frames in, 1 keyframes out (drop 90.9%), 1 queries out, first=0 change=1 heartbeat=0, 312 ms
-Query robot-1/5 "What did the robot just do?": current frame 500 + 8 context frames, 222 KB
+batch 315: 5 frames in, 1 keyframes out (drop 80.0%), 0 queries out, first=0 change=1 heartbeat=0, 210 ms
+Query robot-1/5 "What did the robot just do?": current frame 500 + 8 of 31 memory frames over the last 30.0 s, 206 KB
 ```
 
 **Terminal 3: VLM service** (Ubuntu)
@@ -232,7 +239,7 @@ The service logs the peak VRAM after loading and one line per answer:
 
 ```
 Model loaded: peak VRAM 7162 MiB allocated, 7236 MiB reserved by PyTorch
-Answer robot-1/3 (8+1 frames, inference 2.0 s, end-to-end 2.9 s, peak VRAM 7510 MiB) "What action did the person just perform?" -> The person is raising their right hand in front of them.
+Answer robot-1/5 (8+1 frames over 30.0 s, inference 1.8 s, end-to-end 2.4 s, peak VRAM 7511 MiB) "What did the robot just do?" -> The robot placed the coffee cup on the table.
 ```
 
 **Terminal 4: device** (Windows)
@@ -244,25 +251,10 @@ With a webcam (`--preview` shows the frames in a window; use `--source 1` if ind
 ```
 
 The device starts **without a question**. Type a question and press Enter; every line is a new question, even if
-it repeats an earlier one. The answer appears in the same terminal a few seconds later, with its latency and the
-number of earlier frames the model saw. Type `quit` to stop. The terminal shows only the questions and answers;
+it repeats an earlier one. The answer appears in the same terminal a few seconds later, with its latency and how
+far back the model's images reached. Type `quit` to stop. The terminal shows only the questions and answers;
 everything else (frame rate every 5 s, warnings, Kafka client messages) goes to `logs/<device-id>.log` in the
 repository (`--log-file` changes it).
-
-```
-robot-1 is streaming; type a question and press Enter ('quit' stops). Log: \\wsl.localhost\Ubuntu\home\<wsl-user>\edge-vlm\logs\robot-1.log
-What action did the person just perform?
-A3: The person is raising their right hand in front of them.  [2.9 s, 8 earlier frames + current]
-```
-
-**Questions about actions.** Ask in the past tense: "What did the person just do?". For "What is the person
-doing?" the model describes the current frame, so an action that has just ended is missed even when it is in the
-earlier frames. The defaults were tuned with a webcam pointed at a room:
-- `CHANGE_THRESHOLD=6`: a small motion in a large, still scene changes few bits of the 64-bit dHash (a hand wave
-  peaked at about 10 bits, a still scene stays at 0–3), so a threshold of 10 missed most gestures.
-- `CONTEXT_FRAMES=8`: during motion almost every frame becomes a keyframe, so 4 earlier frames covered less than a
-  second. For the same bundle the model answered "waving their hand in front of the camera" with 8 frames and
-  "lowered their hand after raising it earlier" with 4.
 
 With a video file, first download the sample robot videos once. This fetches 4 files of the LIBERO dataset
 into `data/` (about 145 MB); any other MP4 file works too. A `--questions-file` asks questions automatically
@@ -270,7 +262,17 @@ into `data/` (about 145 MB); any other MP4 file works too. A `--questions-file` 
 
 ```powershell
 & $toolsPy "$repo\tools\fetch_sample_videos.py"
-& $devicePy "$repo\device\device.py" --source "$repo\data\libero-1.mp4" --questions-file "$repo\eval\libero_questions.tsv"
+& $devicePy "$repo\device\device.py" --source "$repo\data\libero-1.mp4" --no-input --questions-file "$repo\eval\libero_questions.tsv"
+```
+
+Terminal output of that run (abridged):
+
+```
+robot-1 is streaming. Log: \\wsl.localhost\Ubuntu\home\<wsl-user>\edge-vlm\logs\robot-1.log
+Q1: What objects are on the table?
+A1: There are three mugs and two saucers on the table.  [2.7 s, 8 earlier frames from the last 10 s + current]
+Q5: What did the robot just do?
+A5: The robot placed the coffee cup on the table.  [2.4 s, 8 earlier frames from the last 30 s + current]
 ```
 
 **Terminal 5: inspect** (Windows; the same commands work in Ubuntu with the tools environment)
@@ -284,18 +286,27 @@ into `data/` (about 145 MB); any other MP4 file works too. A `--questions-file` 
 MongoDB can be inspected from Ubuntu with `mongosh`:
 
 ```bash
-mongosh edge_vlm --quiet --eval 'db.answers.find({}, {_id: 0, question: 1, answer: 1, latency_ms: 1}).sort({_id: -1}).limit(3)'
+mongosh edge_vlm --quiet --eval 'db.answers.find({}, {_id: 0, question: 1, answer: 1, context_span_s: 1, latency_ms: 1}).sort({_id: -1}).limit(3)'
 mongosh edge_vlm --quiet --eval 'db.batch_stats.find().sort({_id: -1}).limit(1)'
 ```
 
 **What you should see**
 
 - **No question:** the processor selects keyframes (`first`, then `change` and `heartbeat`) with `0 queries out`;
-  the `queries` topic stays empty; the VLM service logs nothing and `nvidia-smi` shows the GPU idle.
+  the `queries` topic stays empty and the VLM service runs no inference.
 - **A question:** one `Query` line in the processor, one `Answer` line in the VLM service, and the answer in the
-  device terminal about 2–3 s after you press Enter.
-- **An action, then "What did the person just do?":** the bundle contains the keyframes of the action (`change`),
-  so the model can describe what happened, not just the current frame.
+  device terminal 1–4 s after you press Enter (measured: 1.0–2.8 s on the LIBERO video, 2.0–3.6 s with the webcam).
+- **An action, then a question about it:** the bundle contains frames of the action (`change` keyframes), so the
+  model can describe what happened, not only the current frame.
+
+**Questions about actions.** Ask in the past tense: "What did the person just do?". For "What is the person
+doing?" the model describes the current frame, so an action that has just ended is missed even when it is in the
+earlier frames. The defaults were tuned with the webcam pointed at a room:
+- `CHANGE_THRESHOLD=6`: a still room stayed within 0–3 bits of the 64-bit dHash, while a hand wave peaked at about
+  10 bits, so a threshold of 10 missed most gestures.
+- `CONTEXT_FRAMES=8`: during a movement almost every frame becomes a keyframe. With fewer frames the model saw too
+  little of a gesture: for the same wave it answered "waving their hand in front of the camera" with 8 frames and
+  "lowered their hand after raising it earlier" with 4.
 
 ---
 
@@ -313,8 +324,9 @@ options for the scripts.
 | `SPARK_MASTER` | `local[*]` | Spark master; `local[N]` uses N cores (the scaling knob) |
 | `CHANGE_THRESHOLD` | `6` | dHash Hamming distance (of 64 bits) that counts as a scene change |
 | `HEARTBEAT_S` | `5` | select a keyframe at least this often per device |
-| `WINDOW_MAX_FRAMES` | `8` | visual memory: at most this many keyframes per device… |
-| `WINDOW_SECONDS` | `30` | …from the last this many seconds |
+| `WINDOW_SECONDS` | `30` | visual memory: keyframes of the last this many seconds |
+| `WINDOW_STORE_MAX` | `32` | visual memory: at most this many keyframes per device |
+| `WINDOW_MAX_FRAMES` | `8` | memory frames per question bundle, spread evenly in time, newest included |
 | `WINDOW_IMAGE_MAX_SIDE` | `448` | longest side (pixels) of the images in the visual memory and the bundles |
 | `TRIGGER_MS` | `500` | micro-batch trigger interval |
 | `MAX_OFFSETS_PER_TRIGGER` | `500` | maximum Kafka records per micro-batch |
@@ -328,7 +340,7 @@ options for the scripts.
 | `KAFKA_BOOTSTRAP`, `MONGO_URI` | as above | addresses |
 | `MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | Hugging Face model, loaded in bfloat16 on the GPU |
 | `MAX_PIXELS` | `448*448` | upper bound on the pixels of each image given to the model (a number or a product) |
-| `CONTEXT_FRAMES` | `8` | earlier frames per question (the newest ones of the bundle) plus the current frame; `0` = current frame only |
+| `CONTEXT_FRAMES` | `8` | frames of the bundle given to the model (the newest ones) plus the current frame; `0` = current frame only |
 | `MAX_NEW_TOKENS` | `128` | answer length limit (greedy decoding) |
 | `GROUP_ID` | `vlm-service` | Kafka consumer group; a new group answers every question still in Kafka (see 5.2) |
 | `RUN_ID` | start time | tag stored with every answer |
@@ -360,7 +372,8 @@ tool with `--help` for its options.
 
 Every run gets its own `RUN_ID`, and every MongoDB document carries it, so runs can be compared. Kafka and MongoDB
 keep running between runs. The reports read MongoDB and work from Windows or Ubuntu; `--csv` writes the summary
-for plotting (the `results/` folder is git-ignored).
+for plotting (the `results/` folder is git-ignored). All results below were measured on the development PC (AMD
+Ryzen 7 5700X3D with 8 cores / 16 threads, RTX 3060 12 GB) with the default settings, using the LIBERO sample videos.
 
 ### 5.1 Scaling study: Spark processing (coursework Part 2)
 
@@ -385,7 +398,8 @@ with `--no-input` ask no questions, so this measures the processing alone.
    ```
 4. Let it run for a few minutes (the first batch includes JVM warm-up), then **stop the devices**
    (`$devices | Stop-Process`) and the processor (Ctrl+C).
-5. Repeat steps 1–4 for the other settings, e.g. `SPARK_MASTER=local[1]` with `RUN_ID=E1-local1-dev4`.
+5. Repeat steps 1–4 for the other settings, e.g. `SPARK_MASTER=local[1]` with `RUN_ID=E1-local1-dev4`. Use a new
+   `RUN_ID` for every run: documents of a reused `RUN_ID` would be mixed into one summary.
 6. **Report** the runs side by side:
    ```powershell
    & $toolsPy "$repo\tools\processing_report.py" --run-id E1-local1-dev4 E1-local4-dev4 --csv results\scaling.csv
@@ -396,18 +410,19 @@ the counts per reason, batch duration (mean, p95), ingest delay (processing time
 p95 from the per-batch means weighted by frame count, plus the maximum), `keyframe_delay`
 (`selected_ts_ms − capture_ts_ms` of each keyframe) and the config used.
 
-Example: 4 LIBERO devices at 10 fps for 90 s (AMD Ryzen 7 5700X3D, 8 cores / 16 threads), measured with
-`CHANGE_THRESHOLD=10` (the lower default of 6 selects more `change` keyframes):
+Results: 4 LIBERO devices at 10 fps each, 90 s per run (runs `E1-local1-dev4` and `E1-local4-dev4`):
 
 | metric | `local[1]` | `local[4]` |
 |---|---|---|
-| frames in / s | 39.3 | 39.9 |
-| keyframes (drop ratio) | 216 (0.940) | 216 (0.940) |
-| batch duration mean / p95 (ms) | 501 / 623 | 245 / 292 |
-| ingest delay p50 / p95 (ms) | 739 / 893 | 488 / 705 |
-| keyframe delay p50 / p95 (ms) | 695 / 1009 | 484 / 709 |
+| frames in / s | 39.2 | 39.9 |
+| keyframes (drop ratio) | 420 (0.883) | 419 (0.883) |
+| batch duration mean / p95 (ms) | 521 / 593 | 260 / 300 |
+| ingest delay p50 / p95 (ms) | 716 / 916 | 495 / 610 |
+| keyframe delay p50 / p95 (ms) | 748 / 1076 | 509 / 718 |
 
-Both runs select exactly the same keyframes, because the rules use capture timestamps, not processing time.
+Four cores halve the batch duration and cut the delays by about a third. With one core, a batch (~520 ms) takes
+longer than the 500 ms trigger interval, so Spark logs `Current batch is falling behind` and the delays grow. The
+selection itself does not depend on the cores: both runs keep the same 11.7% of the frames.
 
 Notes for interpreting the results:
 - **Parallelism.** Spark normally runs one task per Kafka partition (`frames` has 4). Because devices are
@@ -415,17 +430,17 @@ Notes for interpreting the results:
   split the partitions into as many tasks as there are cores (`minPartitions`). This keeps every core busy.
 - **Images.** Only metadata of all frames is collected to the driver; the images of the keyframes and question
   frames are downscaled on the executors and collected separately (a few per batch).
-- **Warnings.** `Current batch is falling behind` in the processor log means a batch took longer than
-  `TRIGGER_MS`. This is expected when the cores are too few for the load.
+- **Robot videos move a lot.** The robot arm is almost always moving, so 11.7% of the frames are keyframes. In a
+  10-minute webcam session in a room (mostly still, with gestures and objects shown to the camera) it was 4.1%.
 - **Device side.** Watch the devices' frame rates too (every 5 s in `logs/robot-N.log`): with many devices, JPEG
-  encoding on Windows can become the bottleneck instead of Spark.
+  encoding on Windows can become the bottleneck instead of Spark. In the runs above, all four devices held 10.0 fps.
 
 ### 5.2 Evaluation: answers and latency with and without visual memory
 
 Compares `CONTEXT_FRAMES` values (0 = current frame only) on the same video and the same questions. A questions file
 holds `<seconds><TAB><question>` lines (`#` starts a comment). The time is counted in frames sent
-(seconds × fps), so every run asks each question at exactly the same video frame; with greedy decoding, repeated
-runs give the same answers. `eval/libero_questions.tsv` asks six questions, 10 s apart, about `libero-1.mp4`.
+(seconds × fps), so every run asks each question at exactly the same video frame. `eval/libero_questions.tsv` asks
+six questions, 10 s apart, about `libero-1.mp4`.
 
 1. **Start the processor** (terminal 2) with any `RUN_ID`, e.g. `RUN_ID=E2-processor`. It can keep running for all
    evaluation runs: a restarted device starts with frame 0, which the processor treats as a new device session
@@ -434,14 +449,15 @@ runs give the same answers. `eval/libero_questions.tsv` asks six questions, 10 s
    ```bash
    RUN_ID=E2-ctx0 CONTEXT_FRAMES=0 python vlm_service/service.py
    ```
-3. **Run the device** with the questions file (terminal 4) and wait until the device has printed the answer to
-   the last question (here at about 60 s), then stop it with `quit`:
+3. **Run the device** with the questions file (terminal 4) and wait until it has printed the answer to the last
+   question (`A6`, at about 60 s), then stop it with Ctrl+C:
    ```powershell
-   & $devicePy "$repo\device\device.py" --source "$repo\data\libero-1.mp4" --questions-file "$repo\eval\libero_questions.tsv"
+   & $devicePy "$repo\device\device.py" --source "$repo\data\libero-1.mp4" --no-input --questions-file "$repo\eval\libero_questions.tsv"
    ```
-4. **Stop the VLM service** (Ctrl+C) and repeat steps 2–3 with the other settings, e.g. `RUN_ID=E2-ctx4
+4. **Stop the VLM service** (Ctrl+C) and repeat steps 2–3 with the other settings: `RUN_ID=E2-ctx4
    CONTEXT_FRAMES=4` and `RUN_ID=E2-ctx8 CONTEXT_FRAMES=8`.
-5. **Report** latency and peak VRAM per run and per number of context frames used, and compare the answers:
+5. **Report** latency, time span and peak VRAM per run and per number of context frames used, and compare the
+   answers:
    ```powershell
    & $toolsPy "$repo\tools\latency_report.py" --run-id E2-ctx0 E2-ctx4 E2-ctx8 --csv results\latency.csv
    ```
@@ -451,23 +467,29 @@ runs give the same answers. `eval/libero_questions.tsv` asks six questions, 10 s
 
 `latency_report.py` shows the count and the mean, p50 and p95 of `end_to_end` (answer time minus the capture time
 of the frame that asked), `queue` (inference start minus capture time: Kafka, Spark micro-batch and bundling) and
-`inference` (image decoding, preprocessing and generation), plus the peak VRAM. A question asked early in a run
-can use fewer context frames than `CONTEXT_FRAMES` because the visual memory is not full yet; the report lists
-those answers in their own column.
+`inference` (image decoding, preprocessing and generation); `context_span_s` (how far back the model's images
+reached: mean and minimum); and the peak VRAM.
 
-Example with `libero-1.mp4` and `eval/libero_questions.tsv` (RTX 3060, `MAX_PIXELS=448*448`, 448×336 frames,
-processor with `CHANGE_THRESHOLD=10`):
+Results (runs `E2-ctx0`, `E2-ctx4`, `E2-ctx8`; 6 questions each):
 
-| `CONTEXT_FRAMES` | end-to-end p50 | queue p50 | inference p50 | peak VRAM |
-|---|---|---|---|---|
-| 0 | 1.4 s | 0.5 s | 0.9 s | 7207 MiB |
-| 4 | 2.1 s | 0.5 s | 1.6 s | 7357 MiB |
-| 8 | 2.4 s | 0.4 s | 2.0 s | 7509 MiB |
+| `CONTEXT_FRAMES` | end-to-end p50 | queue p50 | inference p50 | images reach back (mean) | peak VRAM |
+|---|---|---|---|---|---|
+| 0 | 1.2 s | 0.4 s | 0.8 s | 0 s | 7207 MiB |
+| 4 | 1.9 s | 0.4 s | 1.5 s | 11.5 s | 7358 MiB |
+| 8 | 2.7 s | 0.6 s | 2.1 s | 24.8 s | 7511 MiB |
 
-| Question | `CONTEXT_FRAMES=0` | `CONTEXT_FRAMES=4` |
-|---|---|---|
-| What is the robot arm doing? | The robot arm is pouring coffee into a red mug. | The robot arm is moving towards the red mug on the table. |
-| What did the robot just do? | The robot placed the coffee maker on the counter. | The robot placed the coffee cup on the table. |
+Each bundle carries 8 memory frames spread over the last 30 s, so `CONTEXT_FRAMES=4` uses the newer half (about 13 s
+back) and `CONTEXT_FRAMES=8` all of it. The first questions reach back less (10 s and 20 s) because the video had
+only been running that long. Each extra image adds about 0.15 s of inference and 40 MiB of VRAM.
+
+| Question | `CONTEXT_FRAMES=0` | `CONTEXT_FRAMES=4` | `CONTEXT_FRAMES=8` |
+|---|---|---|---|
+| What is the robot arm doing? | The robot arm is pouring coffee into a red mug. | The robot arm is moving towards the red mug on the table. | The robot arm is moving towards the red mug on the table. |
+| What did the robot just do? | The robot placed the coffee maker on the counter. | The robot placed the red mug on the table next to the gray mug. | The robot placed the coffee cup on the table. |
+| Describe the scene. | The robot arm is holding a coffee cup on a table. | The robotic arm is positioned above a coffee cup on a table, preparing to interact with it. | The robotic arm is holding a mug with a handle, moving it towards a microwave oven on a kitchen counter. |
+
+Without earlier frames the model guesses the action from a single image (there is no pouring and no coffee maker
+being moved); with them it describes the movement.
 
 **Same bundles, different settings.** The `queries` topic keeps every bundle for one hour. A VLM service with a
 new consumer group answers all of them again, so settings can also be compared on identical inputs (only one
@@ -494,6 +516,13 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
 - **Keep WSL2 running.** WSL2 may stop the Ubuntu VM when no terminal is open, which also stops MongoDB.
   Keeping the Kafka terminal open prevents this.
 - **Test both sides.** `tools/smoke_test.py` from Ubuntu and from Windows tells you which side fails.
+
+**Kafka**
+
+- `Kafka is already running (port 9092 is in use)`: a broker runs in another terminal or in the background. Use
+  that one, or stop it first (Ctrl+C in its terminal). Never run two brokers on the same data directory.
+- **Kafka storage:** if Kafka refuses to start after a broken first run, delete `~/edge-vlm-data/kafka`
+  (this removes all topics), start Kafka again and rerun `infra/create_topics.py`.
 
 **Webcam**
 
@@ -528,9 +557,9 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
   Frames older than Kafka's one-hour retention are skipped (`failOnDataLoss=false`).
 - **A question is answered twice after restarting the processor:** the processor keeps no state across restarts,
   so it asks each running device's current question once more.
+- **`The value of the provided token to the AccumulatorServer is not correct`** at processor startup: a stray local
+  connection to a PySpark-internal port. It is harmless and was seen once in 17 test runs.
 - **Java:** `java -version` must show 17; Spark 4 does not run on older Java.
-- **Kafka storage:** if Kafka refuses to start after a broken first run, delete `~/edge-vlm-data/kafka`
-  (this removes all topics), start Kafka again and rerun `infra/create_topics.py`.
 - **MongoDB:** check `systemctl status mongod` and `/var/log/mongodb/mongod.log`.
 - **Video files:** the LIBERO videos are AV1-encoded, which the FFmpeg bundled with `opencv-python`
   decodes. Any other MP4 works too.
@@ -551,8 +580,7 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
 ## 8. Repository layout
 
 ```
-CLAUDE.md                     implementation guide (design, conventions, milestones)
-.env.example                  settings template (copy to .env)
+.env.example                  settings template with all defaults (copy to .env)
 infra/kafka_start.sh          (WSL2) formats storage on first run, starts the single-node KRaft broker
 infra/create_topics.py        creates frames / queries / answers (idempotent)
 device/device.py              (Windows) webcam or video producer; questions in, answers out

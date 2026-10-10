@@ -1,7 +1,8 @@
 """Summarise the VLM answers (evaluation) from MongoDB: latency per run and per number of context frames.
 
 For each (run_id, context_frames_used): the number of answers; the mean, p50 and p95 of the end-to-end,
-queue and inference latency; and the peak VRAM. Without --run-id, every run in the collection is shown.
+queue and inference latency; how far back the images reached (context_span_s: oldest context frame to
+current frame); and the peak VRAM. Without --run-id, every run in the collection is shown.
 
     python tools/latency_report.py [--run-id E2-ctx0 E2-ctx4] [--csv results/latency.csv]
 """
@@ -32,6 +33,9 @@ def summarize(answers: list) -> list:
             row[f"{name}_ms_mean"] = mean(values)
             row[f"{name}_ms_p50"] = percentile(values, 50)
             row[f"{name}_ms_p95"] = percentile(values, 95)
+        spans = [a["context_span_s"] for a in group if "context_span_s" in a]  # older answers lack it
+        row["context_span_s_mean"] = mean(spans)
+        row["context_span_s_min"] = min(spans) if spans else None
         row["peak_vram_mb"] = max(a["peak_vram_mb"] for a in group)
         row["model"] = group[0]["model"]
         row["max_pixels"] = group[0]["max_pixels"]

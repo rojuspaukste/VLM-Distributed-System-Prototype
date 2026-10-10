@@ -21,7 +21,8 @@ def show(answer: dict) -> None:
           f"  A: {answer['answer']}\n"
           f"  {latency['end_to_end'] / 1000:.1f} s end to end (queue {latency['queue'] / 1000:.1f} s, "
           f"inference {latency['inference'] / 1000:.1f} s); "
-          f"{answer['context_frames_used']} earlier frames + current, frames {answer['frame_ids_used']}",
+          f"{answer['context_frames_used']} earlier frames from the last {answer.get('context_span_s', 0):.1f} s "
+          f"+ current, frames {answer['frame_ids_used']}",
           flush=True)
 
 

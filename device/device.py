@@ -129,8 +129,9 @@ def print_answers(device_id: str, bootstrap: str, stop: threading.Event) -> None
             answer = json.loads(msg.value())
             if answer.get("device_id") != device_id:
                 continue
-            console.info("A%d: %s  [%.1f s, %d earlier frames + current]", answer["query_id"], answer["answer"],
-                         answer["latency_ms"]["end_to_end"] / 1000, answer["context_frames_used"])
+            console.info("A%d: %s  [%.1f s, %d earlier frames from the last %.0f s + current]", answer["query_id"],
+                         answer["answer"], answer["latency_ms"]["end_to_end"] / 1000, answer["context_frames_used"],
+                         answer.get("context_span_s", 0))
     except KafkaException as exc:
         log.warning("Cannot read answers from %s: %s", ANSWERS_TOPIC, exc)
     finally:

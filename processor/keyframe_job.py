@@ -7,10 +7,11 @@ For every micro-batch read from the Kafka topic `frames`:
      to the last keyframe >= CHANGE_THRESHOLD) or a heartbeat (no keyframe for more than HEARTBEAT_S
      seconds). The first frame that carries a new, non-empty question triggers a query.
   3. Executors downscale just those frames (a second pandas UDF) and the driver collects them.
-  4. The driver keeps a sliding window of recent keyframes per device: its visual memory, held in
-     memory only. Each new question becomes ONE message on the Kafka topic `queries`: the current
-     frame plus the window, so the VLM can answer questions about actions and changes. The bundles
-     are built from driver memory, so the driver publishes them with a Kafka producer.
+  4. The driver keeps the recent keyframes of each device: its visual memory over the last
+     WINDOW_SECONDS, held in memory only. Each new question becomes ONE message on the Kafka topic
+     `queries`: the current frame plus WINDOW_MAX_FRAMES memory frames spread evenly over that time,
+     so the VLM can answer questions about actions and changes. The bundles are built from driver
+     memory, so the driver publishes them with a Kafka producer.
   5. The keyframes' metadata (no images) and one `batch_stats` document go to MongoDB.
 
 Run inside WSL2; all settings come from environment variables (see .env.example):
@@ -20,11 +21,11 @@ import base64
 import io
 import json
 import logging
+import operator
 import os
 import signal
 import sys
 import threading
-import operator
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -52,8 +53,11 @@ TRIGGER_MS = int(os.environ.get("TRIGGER_MS", "500"))
 MAX_OFFSETS_PER_TRIGGER = int(os.environ.get("MAX_OFFSETS_PER_TRIGGER", "500"))
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", os.path.expanduser("~/edge-vlm-data/checkpoint"))
 RUN_ID = os.environ.get("RUN_ID", time.strftime("%Y%m%d-%H%M%S"))
-WINDOW_MAX_FRAMES = int(os.environ.get("WINDOW_MAX_FRAMES", "8"))
+# Visual memory per device: up to WINDOW_STORE_MAX keyframes from the last WINDOW_SECONDS; each
+# question bundle gets WINDOW_MAX_FRAMES of them, spread evenly in time.
 WINDOW_SECONDS = float(os.environ.get("WINDOW_SECONDS", "30"))
+WINDOW_STORE_MAX = int(os.environ.get("WINDOW_STORE_MAX", "32"))
+WINDOW_MAX_FRAMES = int(os.environ.get("WINDOW_MAX_FRAMES", "8"))
 WINDOW_IMAGE_MAX_SIDE = int(os.environ.get("WINDOW_IMAGE_MAX_SIDE", "448"))
 
 FRAMES_TOPIC = "frames"
@@ -140,7 +144,42 @@ class DeviceState:
     last_hash: int                  # dHash of the last keyframe
     last_keyframe_ts_ms: int        # capture time of the last keyframe
     last_instruction_id: int = 0    # 0 = no question asked yet
-    window: deque = field(default_factory=deque)  # WindowFrames, oldest first
+    window: deque = field(default_factory=deque)  # visual memory: WindowFrames, oldest first
+
+
+def remember(window: deque, frame: WindowFrame) -> None:
+    """Adds a frame to a device's visual memory, which keeps at most WINDOW_STORE_MAX frames.
+
+    During motion almost every frame is a keyframe. Dropping the oldest frame would then shrink the
+    memory to the last few seconds, so a full memory instead drops the frame that is closest in time to
+    its predecessor (never the oldest or the newest one): the frames stay spread over the window.
+    """
+    window.append(frame)
+    if len(window) > WINDOW_STORE_MAX:
+        densest = min(range(1, len(window) - 1),
+                      key=lambda i: window[i].capture_ts_ms - window[i - 1].capture_ts_ms)
+        del window[densest]
+
+
+def spread_evenly(frames: list, count: int) -> list:
+    """Picks `count` of `frames` (oldest first) spread evenly in time, always including the newest one.
+
+    For evenly spaced target times from the newest back to the oldest frame, it takes the frame nearest
+    to each target that is not picked yet. Returns the picked frames oldest first.
+    """
+    if len(frames) <= count:
+        return list(frames)
+    if count <= 0:
+        return []
+    newest, oldest = frames[-1].capture_ts_ms, frames[0].capture_ts_ms
+    step = (newest - oldest) / (count - 1) if count > 1 else 0
+    remaining, picked = list(frames), []
+    for i in range(count):
+        target = newest - i * step
+        nearest = min(remaining, key=lambda f: abs(f.capture_ts_ms - target))
+        remaining.remove(nearest)
+        picked.append(nearest)
+    return sorted(picked, key=lambda f: f.capture_ts_ms)
 
 
 @dataclass
@@ -201,37 +240,40 @@ def decide(frames: list, states: dict) -> list:
     return decisions
 
 
-def build_query(decision: Decision, image_b64: str, context: list) -> str:
-    """Returns the `queries` message for a question: the current frame plus the context frames
-    (oldest to newest). If the message would be too large, the oldest context frames are dropped."""
-    message = {
-        "device_id": decision.device_id,
-        "query_id": decision.instruction_id,
-        "question": decision.question,
-        "asked_ts_ms": decision.capture_ts_ms,
-        "bundled_ts_ms": now_ms(),
-        "current_frame": {"frame_id": decision.frame_id, "capture_ts_ms": decision.capture_ts_ms,
-                          "image_b64": image_b64},
-        "context_frames": [{"frame_id": f.frame_id, "capture_ts_ms": f.capture_ts_ms, "reason": f.reason,
-                            "image_b64": f.image_b64} for f in context],
-    }
-    value = json.dumps(message)
-    while len(value) > QUERY_MAX_BYTES and message["context_frames"]:
-        message["context_frames"].pop(0)
+def build_query(decision: Decision, image_b64: str, memory: list) -> str:
+    """Returns the `queries` message for a question: the current frame plus WINDOW_MAX_FRAMES context
+    frames picked evenly in time from the device's visual memory (oldest to newest). If the message
+    would exceed QUERY_MAX_BYTES, fewer frames are picked, still spread over the whole memory."""
+    count = WINDOW_MAX_FRAMES
+    while True:
+        context = spread_evenly(memory, count)
+        message = {
+            "device_id": decision.device_id,
+            "query_id": decision.instruction_id,
+            "question": decision.question,
+            "asked_ts_ms": decision.capture_ts_ms,
+            "bundled_ts_ms": now_ms(),
+            "current_frame": {"frame_id": decision.frame_id, "capture_ts_ms": decision.capture_ts_ms,
+                              "image_b64": image_b64},
+            "context_frames": [{"frame_id": f.frame_id, "capture_ts_ms": f.capture_ts_ms, "reason": f.reason,
+                                "image_b64": f.image_b64} for f in context],
+        }
         value = json.dumps(message)
-    if len(message["context_frames"]) < len(context):
-        log.warning("Query %s/%d: dropped %d oldest context frames to stay under %d bytes",
-                    decision.device_id, decision.instruction_id,
-                    len(context) - len(message["context_frames"]), QUERY_MAX_BYTES)
-    log.info("Query %s/%d \"%s\": current frame %d + %d context frames, %.0f KB",
+        if len(value) <= QUERY_MAX_BYTES or not context:
+            break
+        count = len(context) - 1
+        log.warning("Query %s/%d too large (%d bytes); picking %d context frames instead",
+                    decision.device_id, decision.instruction_id, len(value), count)
+    span_s = (decision.capture_ts_ms - context[0].capture_ts_ms) / 1000 if context else 0.0
+    log.info("Query %s/%d \"%s\": current frame %d + %d of %d memory frames over the last %.1f s, %.0f KB",
              decision.device_id, decision.instruction_id, decision.question, decision.frame_id,
-             len(message["context_frames"]), len(value) / 1024)
+             len(context), len(memory), span_s, len(value) / 1024)
     return value
 
 
 def update_windows(decisions: list, images: dict) -> list:
-    """Replays the decisions in order: bundles each question with its device's window, then adds the
-    frame to the window. Returns the query messages as (device_id, json) pairs."""
+    """Replays the decisions in order: bundles each question with its device's visual memory, then
+    adds the frame to the memory. Returns the query messages as (device_id, json) pairs."""
     queries = []
     for decision in decisions:
         image_b64 = images[(decision.device_id, decision.frame_id)]
@@ -241,10 +283,8 @@ def update_windows(decisions: list, images: dict) -> list:
             window.popleft()
         if decision.question:
             queries.append((decision.device_id, build_query(decision, image_b64, list(window))))
-        window.append(WindowFrame(decision.frame_id, decision.capture_ts_ms, decision.reason or "query",
-                                  image_b64))
-        while len(window) > WINDOW_MAX_FRAMES:
-            window.popleft()
+        remember(window, WindowFrame(decision.frame_id, decision.capture_ts_ms, decision.reason or "query",
+                                     image_b64))
     return queries
 
 
@@ -263,8 +303,9 @@ class KeyframeBatchProcessor:
             "heartbeat_s": HEARTBEAT_S,
             "trigger_ms": TRIGGER_MS,
             "max_offsets_per_trigger": MAX_OFFSETS_PER_TRIGGER,
-            "window_max_frames": WINDOW_MAX_FRAMES,
             "window_seconds": WINDOW_SECONDS,
+            "window_store_max": WINDOW_STORE_MAX,
+            "window_max_frames": WINDOW_MAX_FRAMES,
             "window_image_max_side": WINDOW_IMAGE_MAX_SIDE,
         }
 
@@ -372,6 +413,8 @@ def create_spark() -> SparkSession:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not 1 <= WINDOW_MAX_FRAMES <= WINDOW_STORE_MAX or WINDOW_STORE_MAX < 2:
+        raise SystemExit("Need 1 <= WINDOW_MAX_FRAMES <= WINDOW_STORE_MAX and WINDOW_STORE_MAX >= 2")
     logging.getLogger("py4j").setLevel(logging.WARNING)  # hide py4j's callback-server chatter
 
     mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)

@@ -112,16 +112,17 @@ def main() -> int:
     if not rows:
         return 1
 
-    # One line per metric, one column per run.
-    metric_width = max(len(key) for key in rows[0])
+    # One line per metric, one column per run. Runs of older code versions can lack some config fields.
+    keys = list(dict.fromkeys(key for row in rows for key in row))
+    metric_width = max(len(key) for key in keys)
     column_width = max(12, *(len(row["run_id"]) + 2 for row in rows))
-    for key in rows[0]:
+    for key in keys:
         print(f"{key:<{metric_width}}" + "".join(f"{fmt(row.get(key)):>{column_width}}" for row in rows))
 
     if args.csv:
         Path(args.csv).parent.mkdir(parents=True, exist_ok=True)
         with open(args.csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer = csv.DictWriter(f, fieldnames=keys)
             writer.writeheader()
             for row in rows:
                 writer.writerow({key: round(value, 3) if isinstance(value, float) else value

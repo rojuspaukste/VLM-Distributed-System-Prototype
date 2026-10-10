@@ -68,6 +68,8 @@ def answer_query(backend: VLMBackend, query: dict) -> dict:
     """Answers one query bundle and returns the answer document (without images)."""
     context = query["context_frames"][-CONTEXT_FRAMES:] if CONTEXT_FRAMES > 0 else []
     frames = context + [query["current_frame"]]  # oldest first; the last one is the current frame
+    # How far back the images reach: from the oldest context frame to the current frame.
+    span_ms = frames[-1]["capture_ts_ms"] - frames[0]["capture_ts_ms"]
 
     torch.cuda.reset_peak_memory_stats()
     inference_start_ms = now_ms()
@@ -83,6 +85,7 @@ def answer_query(backend: VLMBackend, query: dict) -> dict:
         "answer": answer,
         "model": backend.name,
         "context_frames_used": len(context),
+        "context_span_s": round(span_ms / 1000, 1),
         "frame_ids_used": [frame["frame_id"] for frame in frames],
         "max_pixels": MAX_PIXELS,
         "timestamps": {
@@ -144,8 +147,8 @@ def main() -> None:
             producer.flush(10)
             answers_collection.insert_one(dict(doc))  # a copy: insert_one adds an _id field
             consumer.commit(message=msg, asynchronous=False)
-            log.info("Answer %s/%d (%d+1 frames, inference %.1f s, end-to-end %.1f s, peak VRAM %d MiB) \"%s\" -> %s",
-                     doc["device_id"], doc["query_id"], doc["context_frames_used"],
+            log.info("Answer %s/%d (%d+1 frames over %.1f s, inference %.1f s, end-to-end %.1f s, peak VRAM %d MiB) "
+                     "\"%s\" -> %s", doc["device_id"], doc["query_id"], doc["context_frames_used"], doc["context_span_s"],
                      doc["latency_ms"]["inference"] / 1000, doc["latency_ms"]["end_to_end"] / 1000,
                      doc["peak_vram_mb"], doc["question"], doc["answer"])
     finally:
