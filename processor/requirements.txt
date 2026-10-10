@@ -1,0 +1,11 @@
+# Processor (processor/keyframe_job.py), runs in WSL2 with Java 17.
+# The Kafka connector is fetched at startup and must match this PySpark version (see the job).
+pyspark==4.1.3
+# pandas + pyarrow are needed for the pandas UDF
+pandas==2.3.3
+pyarrow==25.0.1
+numpy==2.5.3
+pillow==12.3.0
+pymongo==4.18.2
+# publishes the query bundles from the driver
+confluent-kafka==2.15.1

@@ -1,0 +1,4 @@
+# Always check text files out with LF line endings. The working copy lives in WSL2 and is also
+# committed from Windows (GitHub Desktop, core.autocrlf=true); CRLF would break the bash script
+# and make every file look changed to Linux git.
+* text=auto eol=lf

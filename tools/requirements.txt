@@ -1,0 +1,4 @@
+# Tools (tools/*.py) and infra/create_topics.py. Installed on Windows and in WSL2.
+confluent-kafka==2.15.1
+huggingface_hub==1.33.0
+pymongo==4.18.2

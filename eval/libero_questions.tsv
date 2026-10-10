@@ -1,0 +1,10 @@
+# Questions for the LIBERO sample videos (tools/fetch_sample_videos.py), asked automatically by
+#   device.py --source data/libero-1.mp4 --no-input --questions-file eval/libero_questions.tsv
+# Format: <seconds after the start><TAB><question>. The time is counted in frames sent
+# (seconds x fps), so every run asks each question at the same video frame.
+10	What objects are on the table?
+20	What is the robot arm doing?
+30	What changed in the last few seconds?
+40	Is the robot holding anything?
+50	What did the robot just do?
+60	Describe the scene.

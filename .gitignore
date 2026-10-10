@@ -426,3 +426,38 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# --- Edge VLM project ---
+# The documented locations of all runtime data are outside the repository (~/.venvs,
+# ~/edge-vlm-data, ~/.cache/huggingface); these patterns catch copies made inside it.
+
+# Local settings and secrets (HF_TOKEN); .env.example is the committed template
+.env
+# Python virtual environments
+.venv/
+venv/
+env/
+.venvs/
+# Sample videos downloaded by tools/fetch_sample_videos.py
+/data/
+# Spark checkpoints and Spark's local working files
+checkpoint/
+checkpoints/
+spark-warehouse/
+metastore_db/
+derby.log
+# Kafka and MongoDB data directories
+edge-vlm-data/
+kafka-data/
+mongo-data/
+# Device logs (device.py --log-file)
+/logs/
+# Result exports of the report tools (--csv)
+/results/
+*.csv
+# Model weights and Hugging Face caches are never committed
+*.safetensors
+*.gguf
+*.pt
+*.pth
+.cache/

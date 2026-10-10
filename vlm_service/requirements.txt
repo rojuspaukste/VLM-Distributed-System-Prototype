@@ -1,0 +1,11 @@
+# VLM service (vlm_service/service.py), runs in WSL2 on the GPU (NVIDIA driver with CUDA 13 support).
+# PyTorch comes from PyTorch's CUDA 13.0 package index.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.1+cu130
+torchvision==0.29.1+cu130
+# Qwen2.5-VL needs transformers >= 4.49; accelerate loads the weights straight onto the GPU.
+transformers==5.19.0
+accelerate==1.15.0
+pillow==12.3.0
+confluent-kafka==2.15.1
+pymongo==4.18.2
