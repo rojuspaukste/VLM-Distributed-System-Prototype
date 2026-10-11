@@ -7,10 +7,11 @@ server. There, a Spark Structured Streaming job reduces the stream to **keyframe
 the last 30 seconds per device. Each question goes, together with frames from that memory, to an open-source
 vision-language model (**Qwen2.5-VL-3B-Instruct**) on the GPU. **Nothing reaches the model unless you ask.**
 
-**Status (October 2026): Phase 1 is complete.** The whole system runs natively on one Windows PC: Kafka, MongoDB,
-Spark and the VLM service in WSL2 Ubuntu, the camera device on Windows. It has been tested with the LIBERO robot
-videos and with a USB webcam (Logitech C930e); the measured results are in section 5. **Phase 2** will package the
-system with Docker Compose and deploy it somewhere other than the development PC.
+**Status (October 2026): Phase 1 is complete, and the edge server also runs in Docker containers.** The whole system
+runs natively on one Windows PC: Kafka, MongoDB, Spark and the VLM service in WSL2 Ubuntu, the camera device on
+Windows. It has been tested with the LIBERO robot videos and with a USB webcam (Logitech C930e); the measured results
+are in section 6. With Docker Compose the same edge server starts with one command (section 4). Deploying it
+somewhere other than the development PC is the next step.
 
 ```
  Windows                              │ WSL2 Ubuntu
@@ -258,7 +259,7 @@ repository (`--log-file` changes it).
 
 With a video file, first download the sample robot videos once. This fetches 4 files of the LIBERO dataset
 into `data/` (about 145 MB); any other MP4 file works too. A `--questions-file` asks questions automatically
-(see section 5.2):
+(see section 6.2):
 
 ```powershell
 & $toolsPy "$repo\tools\fetch_sample_videos.py"
@@ -310,7 +311,102 @@ earlier frames. The defaults were tuned with the webcam pointed at a room:
 
 ---
 
-## 4. Configuration
+## 4. Run with Docker
+
+The edge server (Kafka, MongoDB, the processor and the VLM service) also runs as Docker Compose services on the same
+PC. The devices and the tools stay on Windows, unchanged: they connect to the same `127.0.0.1:9092` and
+`127.0.0.1:27017` as before. Inside the containers only the addresses differ (`KAFKA_BOOTSTRAP=kafka:19092`,
+`MONGO_URI=mongodb://mongo:27017`); the code is the same.
+
+| Service | Image | Role |
+|---|---|---|
+| `kafka` | `apache/kafka:4.3.1` | single-node KRaft broker. Listener `INTERNAL` (`kafka:19092`) for the containers, `EXTERNAL` (port 9092, advertised as `127.0.0.1:9092`) for devices and tools |
+| `topic-init` | `apache/kafka:4.3.1` | one-shot: creates `frames` (4 partitions), `queries` (4) and `answers` (1), with one-hour retention on `frames` and `queries`, then exits |
+| `mongo` | `mongo:8.0.32` | MongoDB on port 27017, data in the volume `mongo-data` |
+| `processor` | `edge-vlm/processor:1.0` (`processor/Dockerfile`) | Python 3.14, OpenJDK 17 and PySpark 4.1.3. The Kafka connector is downloaded at build time, so startup needs no download. Spark checkpoint in the volume `checkpoint` |
+| `vlm` | `edge-vlm/vlm-service:1.0` (`vlm_service/Dockerfile`) | `pytorch/pytorch:2.14.1-cuda13.0-cudnn9-runtime`, the same PyTorch build as natively, with the GPU. Mounts `~/.cache/huggingface` read-only, so the model is not downloaded again |
+
+Every service has a health check, and they start in order: Kafka healthy → `topic-init` done (and MongoDB healthy) →
+processor and VLM service. The processor counts as healthy once Spark's UI lists its streaming query as active; the
+VLM service once it has joined its Kafka consumer group, which it does after loading the model and a warm-up answer.
+
+**One-time setup**
+
+- Docker Desktop with the WSL 2 engine. In *Settings → Resources → WSL integration*, switch on *Ubuntu*; `docker`
+  then works in Ubuntu. If it reports `permission denied ... docker.sock`, open a new Ubuntu terminal: Docker
+  Desktop has just added your user to the `docker` group.
+- Disk space: about 28 GB (15 GB of images plus 12.5 GB of build cache, which `docker builder prune` frees).
+  Docker Desktop keeps them on C: unless *Settings → Resources → Advanced → Disk image location* points
+  elsewhere; change it before the first build if C: is short of space.
+- The model in `~/.cache/huggingface` (section 1, `hf download`).
+- The GPU must be visible to containers: `docker run --rm --gpus all nvidia/cuda:13.0.3-base-ubuntu24.04 nvidia-smi`.
+
+**Start.** The containers use the native services' ports, so first stop the native Kafka (Ctrl+C in its terminal),
+the processor, the VLM service and MongoDB:
+
+```bash
+sudo systemctl stop mongod
+cd ~/edge-vlm
+docker compose up -d --build --wait     # the first build downloads about 5 GB
+docker compose ps                       # every service healthy; topic-init has exited (0)
+```
+
+Then use the system as in section 3: the device, `watch_answers.py`, `peek.py` and the reports work unchanged, and
+`& $toolsPy "$repo\tools\smoke_test.py"` tests the connection from Windows. Logs and MongoDB:
+
+```bash
+docker compose logs -f processor vlm
+docker compose exec mongo mongosh edge_vlm --quiet --eval 'db.answers.find({}, {_id: 0, question: 1, answer: 1}).sort({_id: -1}).limit(3)'
+```
+
+**Settings and experiment runs.** The services take the environment variables of section 5 from the shell, and
+`docker compose up` recreates the containers whose settings changed:
+
+```bash
+RUN_ID=P3-docker-ctx8 CONTEXT_FRAMES=8 docker compose up -d --wait
+```
+
+The Spark checkpoint survives restarts in the `checkpoint` volume. Before a new experiment run, delete it as in
+section 6.1: `docker compose rm -sf processor && docker volume rm edge-vlm_checkpoint`.
+
+**Stop**
+
+```bash
+docker compose down             # removes the containers; the volumes keep Kafka's and MongoDB's data
+docker compose down -v          # also deletes the volumes
+sudo systemctl start mongod     # back to the native setup (and bash infra/kafka_start.sh)
+```
+
+The containerized MongoDB starts empty: the native runs stay in the native MongoDB.
+
+**Native vs. Docker (measured).** The same questions file (section 6.2) with `CONTEXT_FRAMES=8`, natively (run
+`E2-ctx8`) and in containers (run `P3-docker-ctx8`), on the same PC:
+
+| | native | Docker |
+|---|---|---|
+| end-to-end p50 / p95 | 2.68 / 2.80 s | 2.71 / 2.87 s |
+| queue p50 | 0.59 s | 0.48 s |
+| inference p50 / p95 | 2.09 / 2.18 s | 2.21 / 2.40 s |
+| peak VRAM | 7511 MiB | 7511 MiB |
+| images reach back (mean) | 24.8 s | 24.6 s |
+
+The containers add no measurable latency: the differences of about 0.1 s are within the variation of six questions
+(where a question falls within the 500 ms micro-batch interval alone moves its queue time by up to 0.5 s). The GPU is
+used directly, so inference runs as fast as natively.
+
+- **Startup** (`docker compose up -d --wait`, images built, volumes kept): 22–28 s until every service is healthy.
+  MongoDB is ready after 2.5 s, Kafka after 5–9 s, the topics exist after 10–14 s, the processor's streaming query
+  runs after 20–23 s, and the VLM service has loaded the model and answered its warm-up question after 22–28 s.
+- **Images:** `edge-vlm/vlm-service:1.0` 10 GB (9.8 GB of it is the PyTorch CUDA base image),
+  `edge-vlm/processor:1.0` 2.2 GB, `mongo:8.0.32` 1.3 GB, `apache/kafka:4.3.1` 0.7 GB.
+- **Resources during the run** (`docker stats`, one device at 10 fps): the processor used 1.7 CPU cores on
+  average (up to 7 during micro-batches) and up to 2.8 GB of RAM; Kafka 0.3 cores and 0.8 GB; MongoDB under 0.1
+  core and 0.4 GB; the VLM service 0.2 cores and 2.0 GB of RAM, with the model on the GPU.
+- Exports: `results/part3/` (`native.csv`, `docker.csv`, `startup.txt`, `images.txt`, `docker_stats.txt`).
+
+---
+
+## 5. Configuration
 
 Settings are environment variables for the services (template with defaults in `.env.example`) and command-line
 options for the scripts.
@@ -342,7 +438,7 @@ options for the scripts.
 | `MAX_PIXELS` | `448*448` | upper bound on the pixels of each image given to the model (a number or a product) |
 | `CONTEXT_FRAMES` | `8` | frames of the bundle given to the model (the newest ones) plus the current frame; `0` = current frame only |
 | `MAX_NEW_TOKENS` | `128` | answer length limit (greedy decoding) |
-| `GROUP_ID` | `vlm-service` | Kafka consumer group; a new group answers every question still in Kafka (see 5.2) |
+| `GROUP_ID` | `vlm-service` | Kafka consumer group; a new group answers every question still in Kafka (see 6.2) |
 | `RUN_ID` | start time | tag stored with every answer |
 | `HF_TOKEN` | (unset) | only for gated models |
 
@@ -368,14 +464,14 @@ tool with `--help` for its options.
 
 ---
 
-## 5. Experiments
+## 6. Experiments
 
 Every run gets its own `RUN_ID`, and every MongoDB document carries it, so runs can be compared. Kafka and MongoDB
 keep running between runs. The reports read MongoDB and work from Windows or Ubuntu; `--csv` writes the summary
 for plotting (the `results/` folder is git-ignored). All results below were measured on the development PC (AMD
 Ryzen 7 5700X3D with 8 cores / 16 threads, RTX 3060 12 GB) with the default settings, using the LIBERO sample videos.
 
-### 5.1 Scaling study: Spark processing (coursework Part 2)
+### 6.1 Scaling study: Spark processing (coursework Part 2)
 
 Varies one factor per run, for example the Spark cores (`SPARK_MASTER`) or the number of devices. Devices started
 with `--no-input` ask no questions, so this measures the processing alone.
@@ -435,7 +531,7 @@ Notes for interpreting the results:
 - **Device side.** Watch the devices' frame rates too (every 5 s in `logs/robot-N.log`): with many devices, JPEG
   encoding on Windows can become the bottleneck instead of Spark. In the runs above, all four devices held 10.0 fps.
 
-### 5.2 Evaluation: answers and latency with and without visual memory
+### 6.2 Evaluation: answers and latency with and without visual memory
 
 Compares `CONTEXT_FRAMES` values (0 = current frame only) on the same video and the same questions. A questions file
 holds `<seconds><TAB><question>` lines (`#` starts a comment). The time is counted in frames sent
@@ -502,7 +598,7 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 **Windows cannot reach Kafka or MongoDB (timeouts or `Connect ... failed`)**
 
@@ -540,6 +636,16 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
 - No answers: check that the processor logs `Query` lines and that `peek.py --topic queries` shows bundles. Every
   question is answered in order, so a service that was stopped answers the questions it missed when it starts again.
 
+**Docker**
+
+- `The command 'docker' could not be found in this WSL 2 distro`: Docker Desktop is not running, or its WSL
+  integration for Ubuntu is off.
+- `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`: the terminal was
+  opened before your user joined the `docker` group. Open a new one.
+- `ports are not available` or `address already in use` for 9092 or 27017: the native Kafka or MongoDB still runs.
+- A service stays `starting` or becomes `unhealthy`: `docker compose logs <service>`. The VLM service needs about
+  7.5 GB of free VRAM, and other programs (browsers, game overlays) take some too.
+
 **Kafka connector version**
 
 - The job adds `org.apache.spark:spark-sql-kafka-0-10_2.13:<installed PySpark version>` through
@@ -553,7 +659,7 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
 
 **Other issues**
 
-- **The processor starts with a burst of old frames:** the checkpoint was not deleted (see section 5.1).
+- **The processor starts with a burst of old frames:** the checkpoint was not deleted (see section 6.1).
   Frames older than Kafka's one-hour retention are skipped (`failOnDataLoss=false`).
 - **A question is answered twice after restarting the processor:** the processor keeps no state across restarts,
   so it asks each running device's current question once more.
@@ -566,7 +672,7 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
 
 ---
 
-## 7. Data and privacy
+## 8. Data and privacy
 
 - **Images exist only in Kafka and in memory.** `frames` and `queries` keep them for one hour (`retention.ms`, with
   10-minute segments so that old data really is deleted on time). Spark caches each micro-batch in memory only
@@ -576,22 +682,29 @@ RUN_ID=E2-replay-ctx0 CONTEXT_FRAMES=0 GROUP_ID=replay-ctx0 python vlm_service/s
   answer, frame ids, timestamps and latencies.
 - The downloaded sample videos in `data/`, the device logs in `logs/` and the report exports in `results/` are
   git-ignored.
+- **Docker:** the images contain code and libraries only, no data and no model weights. Kafka's data, MongoDB's
+  data and the Spark checkpoint live in named volumes; `docker compose down -v` deletes them.
 
-## 8. Repository layout
+## 9. Repository layout
 
 ```
 .env.example                  settings template with all defaults (copy to .env)
+docker-compose.yml            the edge server in containers: Kafka, topic-init, MongoDB, processor, VLM service
 infra/kafka_start.sh          (WSL2) formats storage on first run, starts the single-node KRaft broker
 infra/create_topics.py        creates frames / queries / answers (idempotent)
 device/device.py              (Windows) webcam or video producer; questions in, answers out
 processor/keyframe_job.py     (WSL2) Spark job: keyframes, visual memory, question bundles
+processor/Dockerfile          processor image: Python 3.14, Java 17, PySpark and the Kafka connector
 vlm_service/service.py        (WSL2, GPU) answers every question, stores the answers
 vlm_service/backends.py       VLM backend interface and the Qwen2.5-VL implementation
+vlm_service/Dockerfile        VLM service image: PyTorch 2.14.1 with CUDA 13.0
 tools/smoke_test.py           Kafka round-trip test
 tools/peek.py                 newest messages of a topic, without image data
 tools/watch_answers.py        live view of the answers
 tools/fetch_sample_videos.py  downloads LIBERO sample videos into data/
 tools/processing_report.py    scaling study: processing summary per RUN_ID
+tools/run_scaling_study.py    scaling study: runs the processor with N devices per setting
+tools/clock_check.py          (Windows) compares the WSL2 and Windows clocks that the latencies rely on
 tools/latency_report.py       evaluation: answer latency per RUN_ID and number of context frames
 eval/libero_questions.tsv     scheduled questions for the LIBERO sample video
 ```

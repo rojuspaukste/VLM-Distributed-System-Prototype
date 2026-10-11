@@ -1,0 +1,158 @@
+# The edge server in containers: Kafka, MongoDB, the Spark processor and the VLM service.
+# Devices and tools stay on the host and connect to 127.0.0.1:9092 (Kafka) and 127.0.0.1:27017 (MongoDB),
+# so the native Kafka and MongoDB must be stopped first. Run in WSL2 Ubuntu from the repository root:
+#   docker compose up -d --build --wait     build the images, start everything, wait until all are healthy
+#   docker compose logs -f processor vlm    follow the services' logs
+#   docker compose down                     stop; the named volumes keep the data
+# The services read the same environment variables as the native ones, taken from the shell when set:
+#   RUN_ID=P3-docker-ctx8 CONTEXT_FRAMES=8 docker compose up -d --wait
+name: edge-vlm
+
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    ports:
+      - "9092:9092"
+    environment:
+      # One node in KRaft mode that is both broker and controller (as infra/kafka_start.sh).
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # INTERNAL (kafka:19092) for the containers; EXTERNAL for devices and tools on the host, published as
+      # port 9092 and advertised as 127.0.0.1:9092 (reachable from WSL2 and from Windows).
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # A single broker can hold only one replica of Kafka's internal topics.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Topics are created by topic-init only.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # The empty data volume is formatted with this cluster id on the first start.
+      CLUSTER_ID: YuIZCxdeTru9V3gExF4yKw
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:19092 > /dev/null"]
+      interval: 10s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+
+  topic-init:
+    # One-shot: creates the topics with the settings of infra/create_topics.py, then exits.
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        create="/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --replication-factor 1"
+        # Frames and query bundles contain images: kept for one hour, in 10-minute segments.
+        $$create --topic frames --partitions 4 --config retention.ms=3600000 --config segment.ms=600000
+        $$create --topic queries --partitions 4 --config retention.ms=3600000 --config segment.ms=600000
+        $$create --topic answers --partitions 1
+
+  mongo:
+    image: mongo:8.0.32
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+
+  processor:
+    build: ./processor
+    image: edge-vlm/processor:1.0
+    depends_on:  # topic-init itself waits for Kafka
+      topic-init:
+        condition: service_completed_successfully
+      mongo:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:19092
+      MONGO_URI: mongodb://mongo:27017
+      CHECKPOINT_DIR: /data/checkpoint
+      # Taken from the shell when set there; otherwise the job's defaults apply.
+      RUN_ID:
+      SPARK_MASTER:
+      CHANGE_THRESHOLD:
+      HEARTBEAT_S:
+      TRIGGER_MS:
+      MAX_OFFSETS_PER_TRIGGER:
+      WINDOW_SECONDS:
+      WINDOW_STORE_MAX:
+      WINDOW_MAX_FRAMES:
+      WINDOW_IMAGE_MAX_SIDE:
+    volumes:
+      - checkpoint:/data/checkpoint
+    stop_grace_period: 30s  # the job stops its streaming query cleanly on SIGTERM
+    healthcheck:
+      # Healthy once Spark's UI lists the streaming query as active.
+      test: ["CMD", "python", "-c", "import sys, urllib.request; page = urllib.request.urlopen('http://localhost:4040/StreamingQuery/', timeout=5).read(); sys.exit(b'Active Streaming Queries (1)' not in page)"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+      start_interval: 2s
+
+  vlm:
+    build: ./vlm_service
+    image: edge-vlm/vlm-service:1.0
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+      mongo:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:19092
+      MONGO_URI: mongodb://mongo:27017
+      # The model comes from the mounted cache; nothing is downloaded.
+      HF_HUB_OFFLINE: 1
+      # Taken from the shell when set there; otherwise the service's defaults apply.
+      RUN_ID:
+      MODEL_ID:
+      MAX_PIXELS:
+      CONTEXT_FRAMES:
+      MAX_NEW_TOKENS:
+      GROUP_ID:
+    volumes:
+      # The native setup's Hugging Face cache, read-only, so the ~7 GB model is not downloaded again.
+      - ~/.cache/huggingface:/root/.cache/huggingface:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      # Healthy once the service has joined its Kafka consumer group, which it does after loading the model
+      # and the warm-up answer.
+      test: ["CMD", "python", "-c", "import os, sys; from confluent_kafka.admin import AdminClient; group = os.environ.get('GROUP_ID') or 'vlm-service'; admin = AdminClient({'bootstrap.servers': os.environ['KAFKA_BOOTSTRAP']}); sys.exit(not admin.describe_consumer_groups([group])[group].result(10).members)"]
+      interval: 10s
+      timeout: 15s
+      retries: 3
+      start_period: 300s
+      start_interval: 2s
+
+volumes:
+  kafka-data:
+  mongo-data:
+  checkpoint:
