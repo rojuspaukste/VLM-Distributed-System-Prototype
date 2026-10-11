@@ -3,7 +3,7 @@
 For each run: throughput, queries out, drop ratio and reasons, batch duration, ingest delay,
 keyframe delay and the processor config. Several runs are printed side by side for comparison.
 
-    python tools/processing_report.py --run-id E1-local1 E1-local4 [--csv summary.csv]
+    python tools/processing_report.py --run-id E1-local1 E1-local4 [--skip-seconds 10] [--csv summary.csv]
 """
 import argparse
 import csv
@@ -32,12 +32,18 @@ def mean(values: list):
     return sum(values) / len(values) if values else None
 
 
-def summarize(db, run_id: str):
-    """Returns one flat dict of metrics for a run, or None if the run has no batch_stats."""
+def summarize(db, run_id: str, skip_seconds: float = 0):
+    """Returns one flat dict of metrics for a run, or None if the run has no batch_stats. Batches that
+    started in the first `skip_seconds` of the run (warm-up) are left out."""
     stats = list(db.batch_stats.find({"run_id": run_id}, {"_id": 0}).sort("batch_id", 1))
     if not stats:
         return None
-    keyframes = list(db.keyframes.find({"run_id": run_id}, {"_id": 0, "capture_ts_ms": 1, "selected_ts_ms": 1}))
+    cutoff_ms = stats[0]["batch_start_ms"] + skip_seconds * 1000
+    stats = [s for s in stats if s["batch_start_ms"] >= cutoff_ms]
+    if not stats:
+        return None
+    keyframes = list(db.keyframes.find({"run_id": run_id, "selected_ts_ms": {"$gte": cutoff_ms}},
+                                       {"_id": 0, "capture_ts_ms": 1, "selected_ts_ms": 1}))
 
     frames_in = sum(s["frames_in"] for s in stats)
     keyframes_out = sum(s["keyframes_out"] for s in stats)
@@ -59,6 +65,7 @@ def summarize(db, run_id: str):
 
     return {
         "run_id": run_id,
+        "skipped_s": skip_seconds,
         "devices": len(devices),
         "batches": len(stats),
         "duration_s": duration_s,
@@ -96,6 +103,8 @@ def fmt(value) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Summarise processor runs from MongoDB.")
     parser.add_argument("--run-id", nargs="+", required=True, help="one or more run ids to summarise")
+    parser.add_argument("--skip-seconds", type=float, default=0,
+                        help="leave out batches from the first N seconds of each run (warm-up)")
     parser.add_argument("--csv", help="also write the per-run summary to this CSV file")
     parser.add_argument("--mongo-uri", default=os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27017"),
                         help="MongoDB URI (default: $MONGO_URI or mongodb://127.0.0.1:27017)")
@@ -104,7 +113,7 @@ def main() -> int:
     db = MongoClient(args.mongo_uri, serverSelectionTimeoutMS=5000)["edge_vlm"]
     rows = []
     for run_id in args.run_id:
-        row = summarize(db, run_id)
+        row = summarize(db, run_id, args.skip_seconds)
         if row is None:
             print(f"Warning: no batch_stats for run {run_id}")
         else:
